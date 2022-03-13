@@ -14,11 +14,10 @@ except TypeError:
 
 class InvertibleCheckpointFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, fn, fn_inverse, keep_input, num_bwd_passes, preserve_rng_state, num_inputs, *inputs_and_weights):
+    def forward(ctx, fn, fn_inverse, num_bwd_passes, preserve_rng_state, num_inputs, *inputs_and_weights):
         # store in context
         ctx.fn = fn
         ctx.fn_inverse = fn_inverse
-        ctx.keep_input = keep_input
         ctx.weights = inputs_and_weights[num_inputs:]
         ctx.num_bwd_passes = num_bwd_passes
         ctx.preserve_rng_state = preserve_rng_state
@@ -56,13 +55,7 @@ class InvertibleCheckpointFunction(torch.autograd.Function):
 
         # clear memory from inputs
         # only clear memory of node features
-        if not ctx.keep_input:
-            if not pytorch_version_one_and_above:
-                # PyTorch 0.4 way to clear storage for node features
-                inputs[0].data.set_()
-            else:
-                # PyTorch 1.0+ way to clear storage for node features
-                inputs[0].storage().resize_(0)
+        inputs[0].storage().resize_(0)
 
         # store these tensor nodes for backward pass
         ctx.inputs = [inputs] * num_bwd_passes
@@ -82,41 +75,30 @@ class InvertibleCheckpointFunction(torch.autograd.Function):
         outputs = ctx.outputs.pop()
 
         # recompute input if necessary
-        if not ctx.keep_input:
-            # Stash the surrounding rng state, and mimic the state that was
-            # present at this time during forward.  Restore the surrounding state
-            # when we're done.
-            rng_devices = []
-            if ctx.preserve_rng_state and ctx.had_cuda_in_fwd:
-                rng_devices = ctx.fwd_gpu_devices
-            with torch.random.fork_rng(devices=rng_devices, enabled=ctx.preserve_rng_state):
-                if ctx.preserve_rng_state:
-                    torch.set_rng_state(ctx.fwd_cpu_state)
-                    if ctx.had_cuda_in_fwd:
-                        set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
-                # recompute input
-                with torch.no_grad():
-                    # edge_index and edge_emb
-                    inputs_inverted = ctx.fn_inverse(*(outputs+inputs[1:]))
-                    # clear memory from outputs
-                    if not pytorch_version_one_and_above:
-                        # PyTorch 0.4 way to clear storage
-                        for element in outputs:
-                            element.data.set_()
-                    else:
-                        # PyTorch 1.0+ way to clear storage
-                        for element in outputs:
-                            element.storage().resize_(0)
+        # Stash the surrounding rng state, and mimic the state that was
+        # present at this time during forward.  Restore the surrounding state
+        # when we're done.
+        rng_devices = []
+        if ctx.preserve_rng_state and ctx.had_cuda_in_fwd:
+            rng_devices = ctx.fwd_gpu_devices
+        with torch.random.fork_rng(devices=rng_devices, enabled=ctx.preserve_rng_state):
+            if ctx.preserve_rng_state:
+                torch.set_rng_state(ctx.fwd_cpu_state)
+                if ctx.had_cuda_in_fwd:
+                    set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
+            # recompute input
+            with torch.no_grad():
+                # edge_index and edge_emb
+                inputs_inverted = ctx.fn_inverse(*(outputs+inputs[1:]))
+                # clear memory from outputs
+                for element in outputs:
+                    element.storage().resize_(0)
 
-                    if not isinstance(inputs_inverted, tuple):
-                        inputs_inverted = (inputs_inverted,)
-                    if pytorch_version_one_and_above:
-                        for element_original, element_inverted in zip(inputs, inputs_inverted):
-                            element_original.storage().resize_(int(np.prod(element_original.size())))
-                            element_original.set_(element_inverted)
-                    else:
-                        for element_original, element_inverted in zip(inputs, inputs_inverted):
-                            element_original.set_(element_inverted)
+                if not isinstance(inputs_inverted, tuple):
+                    inputs_inverted = (inputs_inverted,)
+                for element_original, element_inverted in zip(inputs, inputs_inverted):
+                    element_original.storage().resize_(int(np.prod(element_original.size())))
+                    element_original.set_(element_inverted)
 
         # compute gradients
         with torch.set_grad_enabled(True):
@@ -154,11 +136,11 @@ class InvertibleCheckpointFunction(torch.autograd.Function):
 
         gradients = tuple(input_gradients) + gradients[-len(ctx.weights):]
 
-        return (None, None, None, None, None, None) + gradients
+        return (None, None, None, None, None) + gradients
 
 
 class InvertibleModuleWrapper(nn.Module):
-    def __init__(self, fn, keep_input=False, keep_input_inverse=False, num_bwd_passes=1,
+    def __init__(self, fn, num_bwd_passes=1,
                  disable=False, preserve_rng_state=False):
         """
         The InvertibleModuleWrapper which enables memory savings during training by exploiting
@@ -170,14 +152,6 @@ class InvertibleModuleWrapper(nn.Module):
                 A torch.nn.Module which has a forward and an inverse function implemented with
                 :math:`x == m.inverse(m.forward(x))`
 
-            keep_input : :obj:`bool`, optional
-                Set to retain the input information on forward, by default it can be discarded since it will be
-                reconstructed upon the backward pass.
-
-            keep_input_inverse : :obj:`bool`, optional
-                Set to retain the input information on inverse, by default it can be discarded since it will be
-                reconstructed upon the backward pass.
-
             num_bwd_passes :obj:`int`, optional
                 Number of backward passes to retain a link with the output. After the last backward pass the output
                 is discarded and memory is freed.
@@ -188,29 +162,15 @@ class InvertibleModuleWrapper(nn.Module):
             disable : :obj:`bool`, optional
                 This will disable using the InvertibleCheckpointFunction altogether.
                 Essentially this renders the function as `y = fn(x)` without any of the memory savings.
-                Setting this to true will also ignore the keep_input and keep_input_inverse properties.
 
             preserve_rng_state : :obj:`bool`, optional
                 Setting this will ensure that the same RNG state is used during reconstruction of the inputs.
-                I.e. if keep_input = False on forward or keep_input_inverse = False on inverse. By default
+                By default
                 this is False since most invertible modules should have a valid inverse and hence are
                 deterministic.
-
-        Attributes
-        ----------
-            keep_input : :obj:`bool`, optional
-                Set to retain the input information on forward, by default it can be discarded since it will be
-                reconstructed upon the backward pass.
-
-            keep_input_inverse : :obj:`bool`, optional
-                Set to retain the input information on inverse, by default it can be discarded since it will be
-                reconstructed upon the backward pass.
-
         """
         super(InvertibleModuleWrapper, self).__init__()
         self.disable = disable
-        self.keep_input = keep_input
-        self.keep_input_inverse = keep_input_inverse
         self.num_bwd_passes = num_bwd_passes
         self.preserve_rng_state = preserve_rng_state
         self._fn = fn
@@ -233,7 +193,6 @@ class InvertibleModuleWrapper(nn.Module):
             y = InvertibleCheckpointFunction.apply(
                 self._fn.forward,
                 self._fn.inverse,
-                self.keep_input,
                 self.num_bwd_passes,
                 self.preserve_rng_state,
                 len(xin),
@@ -264,7 +223,6 @@ class InvertibleModuleWrapper(nn.Module):
             x = InvertibleCheckpointFunction.apply(
                 self._fn.inverse,
                 self._fn.forward,
-                self.keep_input_inverse,
                 self.num_bwd_passes,
                 self.preserve_rng_state,
                 len(yin),
