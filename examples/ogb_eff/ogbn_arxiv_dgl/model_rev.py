@@ -324,8 +324,7 @@ class RevGAT(nn.Module):
                 invertible_module = memgcn.GroupAdditiveCoupling(Fms,
                                                                  group=self.group)
 
-                conv = memgcn.InvertibleModuleWrapper(fn=invertible_module,
-                                                      keep_input=False)
+                conv = memgcn.InvertibleModuleWrapper(fn=invertible_module)
 
                 self.convs.append(conv)
 
