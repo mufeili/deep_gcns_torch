@@ -307,6 +307,8 @@ class InvertibleCheckpoint(torch.autograd.Function):
 
             if not isinstance(inputs_inverted, tuple):
                 inputs_inverted = (inputs_inverted,)
+            import ipdb
+            ipdb.set_trace()
             for element_original, element_inverted in zip(inputs, inputs_inverted):
                 element_original.storage().resize_(int(np.prod(element_original.size())))
                 element_original.set_(element_inverted)
