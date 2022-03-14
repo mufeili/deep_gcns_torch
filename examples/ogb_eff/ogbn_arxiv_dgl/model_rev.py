@@ -279,7 +279,7 @@ class InvertibleCheckpoint(torch.autograd.Function):
 
         # clear memory from inputs
         # only clear memory of node features
-        inputs[1].storage().resize_(0)
+        inputs[0].storage().resize_(0)
 
         # store these tensor nodes for backward pass
         ctx.inputs = [inputs]
@@ -299,8 +299,8 @@ class InvertibleCheckpoint(torch.autograd.Function):
 
         # recompute input
         with torch.no_grad():
-            # inputs[0] gives DGLGraph and inputs[1] gives input node features
-            inputs_inverted = ctx.fn_inverse(*(inputs[:1]+outputs+inputs[2:]))
+            # g and edge_emb
+            inputs_inverted = ctx.fn_inverse(*(outputs+inputs[1:]))
             # clear memory from outputs
             for element in outputs:
                 element.storage().resize_(0)
@@ -361,7 +361,7 @@ class InvertibleModuleWrapper(nn.Module):
                 self.Fms.append(deepcopy(fm))
         self.group = group
 
-    def _forward(self, g, x, *args):
+    def _forward(self, x, g, *args):
         xs = torch.chunk(x, self.group, dim=-1)
         chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=-1), args))
         args_chunks = list(zip(*chunked_args))
@@ -378,7 +378,7 @@ class InvertibleModuleWrapper(nn.Module):
 
         return out
 
-    def _inverse(self, g, y, *args):
+    def _inverse(self, y, g, *args):
         ys = torch.chunk(y, self.group, dim=-1)
         chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=-1), args))
         args_chunks = list(zip(*chunked_args))
@@ -510,7 +510,7 @@ class RevGAT(nn.Module):
         for i in range(1, self.n_layers-1):
             graph.requires_grad = False
             perm = torch.stack([self.perms[i]]*self.group, dim=1)
-            h = self.convs[i](graph, h, mask, perm)
+            h = self.convs[i](h, graph, mask, perm)
 
         h = self.norm(h)
         h = self.activation(h, inplace=True)
