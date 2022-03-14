@@ -296,7 +296,6 @@ class InvertibleCheckpoint(torch.autograd.Function):
 
         # recompute input
         with torch.no_grad():
-            # g and edge_emb
             inputs_inverted = ctx.fn_inverse(*(outputs+inputs[1:]))
             # clear memory from outputs
             outputs[0].storage().resize_(0)
@@ -317,11 +316,9 @@ class InvertibleCheckpoint(torch.autograd.Function):
             for det_input, requires_grad in zip(detached_inputs, ctx.input_requires_grad):
                 det_input.requires_grad = requires_grad
             temp_output = ctx.fn(*detached_inputs)
-        if not isinstance(temp_output, tuple):
-            temp_output = (temp_output,)
 
         filtered_detached_inputs = tuple(filter(lambda x: x.requires_grad, detached_inputs))
-        gradients = torch.autograd.grad(outputs=temp_output,
+        gradients = torch.autograd.grad(outputs=(temp_output,),
                                         inputs=filtered_detached_inputs + ctx.weights,
                                         grad_outputs=grad_outputs)
 
@@ -391,7 +388,7 @@ class InvertibleModuleWrapper(nn.Module):
 
         return x
 
-    def forward(self, *xin):
+    def forward(self, g, x, *args):
         """Forward operation :math:`R(x) = y`
 
         Parameters
@@ -405,11 +402,12 @@ class InvertibleModuleWrapper(nn.Module):
                 Output torch tensor(s) *y.
 
         """
+        args = (x, g) + args
         y = InvertibleCheckpoint.apply(
             self._forward,
             self._inverse,
-            len(xin),
-            *(xin + tuple([p for p in self.parameters() if p.requires_grad])))
+            len(args),
+            *(args + tuple([p for p in self.parameters() if p.requires_grad])))
 
         # If the layer only has one input, we unpack the tuple again
         if isinstance(y, tuple) and len(y) == 1:
@@ -503,7 +501,7 @@ class RevGAT(nn.Module):
         for i in range(1, self.n_layers-1):
             graph.requires_grad = False
             perm = torch.stack([self.perms[i]]*self.group, dim=1)
-            h = self.convs[i](h, graph, mask, perm)
+            h = self.convs[i](graph, h, mask, perm)
 
         h = self.norm(h)
         h = self.activation(h, inplace=True)
