@@ -249,56 +249,6 @@ class RevGATBlock(nn.Module):
         out = self.conv(graph, out, perm).flatten(1, -1)
         return out
 
-class GroupAdditiveCoupling(torch.nn.Module):
-    def __init__(self, fm, group=2):
-        super(GroupAdditiveCoupling, self).__init__()
-
-        self.Fms = nn.ModuleList()
-        for i in range(group):
-            if i == 0:
-                self.Fms.append(fm)
-            else:
-                self.Fms.append(deepcopy(fm))
-
-        self.group = group
-
-    def forward(self, x, edge_index, *args):
-        xs = torch.chunk(x, self.group, dim=-1)
-        chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=-1), args))
-        args_chunks = list(zip(*chunked_args))
-        y_in = sum(xs[1:])
-
-        ys = []
-        for i in range(self.group):
-            Fmd = self.Fms[i](y_in, edge_index, *args_chunks[i])
-            y = xs[i] + Fmd
-            y_in = y
-            ys.append(y)
-
-        out = torch.cat(ys, dim=-1)
-
-        return out
-
-    def inverse(self, y, edge_index, *args):
-        ys = torch.chunk(y, self.group, dim=-1)
-        chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=-1), args))
-        args_chunks = list(zip(*chunked_args))
-
-        xs = []
-        for i in range(self.group-1, -1, -1):
-            if i != 0:
-                y_in = ys[i-1]
-            else:
-                y_in = sum(xs)
-
-            Fmd = self.Fms[i](y_in, edge_index, *args_chunks[i])
-            x = ys[i] - Fmd
-            xs.append(x)
-
-        x = torch.cat(xs[::-1], dim=-1)
-
-        return x
-
 class InvertibleCheckpoint(torch.autograd.Function):
     @staticmethod
     def forward(ctx, fn, fn_inverse, num_inputs, *inputs_and_weights):
@@ -329,7 +279,7 @@ class InvertibleCheckpoint(torch.autograd.Function):
 
         # clear memory from inputs
         # only clear memory of node features
-        inputs[0].storage().resize_(0)
+        inputs[1].storage().resize_(0)
 
         # store these tensor nodes for backward pass
         ctx.inputs = [inputs]
@@ -349,14 +299,16 @@ class InvertibleCheckpoint(torch.autograd.Function):
 
         # recompute input
         with torch.no_grad():
-            # edge_index and edge_emb
-            inputs_inverted = ctx.fn_inverse(*(outputs+inputs[1:]))
+            # inputs[0] gives DGLGraph and inputs[1] gives input node features
+            inputs_inverted = ctx.fn_inverse(*(inputs[:1]+outputs+inputs[2:]))
             # clear memory from outputs
             for element in outputs:
                 element.storage().resize_(0)
 
             if not isinstance(inputs_inverted, tuple):
                 inputs_inverted = (inputs_inverted,)
+            import ipdb
+            ipdb.set_trace()
             for element_original, element_inverted in zip(inputs, inputs_inverted):
                 element_original.storage().resize_(int(np.prod(element_original.size())))
                 element_original.set_(element_inverted)
@@ -411,7 +363,7 @@ class InvertibleModuleWrapper(nn.Module):
                 self.Fms.append(deepcopy(fm))
         self.group = group
 
-    def _forward(self, x, edge_index, *args):
+    def _forward(self, g, x, *args):
         xs = torch.chunk(x, self.group, dim=-1)
         chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=-1), args))
         args_chunks = list(zip(*chunked_args))
@@ -419,7 +371,7 @@ class InvertibleModuleWrapper(nn.Module):
 
         ys = []
         for i in range(self.group):
-            Fmd = self.Fms[i](y_in, edge_index, *args_chunks[i])
+            Fmd = self.Fms[i](y_in, g, *args_chunks[i])
             y = xs[i] + Fmd
             y_in = y
             ys.append(y)
@@ -428,7 +380,7 @@ class InvertibleModuleWrapper(nn.Module):
 
         return out
 
-    def _inverse(self, y, edge_index, *args):
+    def _inverse(self, g, y, *args):
         ys = torch.chunk(y, self.group, dim=-1)
         chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=-1), args))
         args_chunks = list(zip(*chunked_args))
@@ -440,7 +392,7 @@ class InvertibleModuleWrapper(nn.Module):
             else:
                 y_in = sum(xs)
 
-            Fmd = self.Fms[i](y_in, edge_index, *args_chunks[i])
+            Fmd = self.Fms[i](y_in, g, *args_chunks[i])
             x = ys[i] - Fmd
             xs.append(x)
 
@@ -532,9 +484,6 @@ class RevGAT(nn.Module):
                     use_symmetric_norm=use_symmetric_norm,
                     residual=True,
                 )
-                # invertible_module = GroupAdditiveCoupling(fm, group=self.group)
-
-                # conv = InvertibleModuleWrapper(fn=invertible_module)
                 conv = InvertibleModuleWrapper(fm, group=self.group)
                 self.convs.append(conv)
 
@@ -563,7 +512,7 @@ class RevGAT(nn.Module):
         for i in range(1, self.n_layers-1):
             graph.requires_grad = False
             perm = torch.stack([self.perms[i]]*self.group, dim=1)
-            h = self.convs[i](h, graph, mask, perm)
+            h = self.convs[i](graph, h, mask, perm)
 
         h = self.norm(h)
         h = self.activation(h, inplace=True)
