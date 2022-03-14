@@ -255,10 +255,16 @@ class RevGATBlock(nn.Module):
         return out
 
 class GroupAdditiveCoupling(torch.nn.Module):
-    def __init__(self, Fms, group=2):
+    def __init__(self, fm, group=2):
         super(GroupAdditiveCoupling, self).__init__()
 
-        self.Fms = Fms
+        self.Fms = nn.ModuleList()
+        for i in range(self.group):
+            if i == 0:
+                self.Fms.append(fm)
+            else:
+                self.Fms.append(copy.deepcopy(fm))
+
         self.group = group
 
     def forward(self, x, edge_index, *args):
@@ -508,7 +514,6 @@ class RevGAT(nn.Module):
                     )
                 )
             else:
-                Fms = nn.ModuleList()
                 fm = RevGATBlock(
                     in_hidden // group,
                     0,
@@ -521,13 +526,7 @@ class RevGAT(nn.Module):
                     use_symmetric_norm=use_symmetric_norm,
                     residual=True,
                 )
-                for i in range(self.group):
-                    if i == 0:
-                        Fms.append(fm)
-                    else:
-                        Fms.append(copy.deepcopy(fm))
-
-                invertible_module = GroupAdditiveCoupling(Fms, group=self.group)
+                invertible_module = GroupAdditiveCoupling(fm, group=self.group)
 
                 conv = InvertibleModuleWrapper(fn=invertible_module)
 
