@@ -7,7 +7,7 @@ from dgl import function as fn
 from dgl.ops import edge_softmax
 from dgl.utils import expand_as_pair
 from eff_gcn_modules.rev.rev_layer import SharedDropout
-from copy import deepcopy
+from dgl.nn import GroupRevRes
 
 class ElementWiseLinear(nn.Module):
     def __init__(self, size, weight=True, bias=True, inplace=False):
@@ -249,165 +249,6 @@ class RevGATBlock(nn.Module):
         out = self.conv(graph, out, perm).flatten(1, -1)
         return out
 
-class InvertibleCheckpoint(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, fn, fn_inverse, num_inputs, *inputs_and_weights):
-        # store in context
-        ctx.fn = fn
-        ctx.fn_inverse = fn_inverse
-        ctx.weights = inputs_and_weights[num_inputs:]
-        inputs = inputs_and_weights[:num_inputs]
-
-        ctx.input_requires_grad = [element.requires_grad for element in inputs]
-
-        with torch.no_grad():
-            # Makes a detached copy which shares the storage
-            x = []
-            for element in inputs:
-                if isinstance(element, torch.Tensor):
-                    x.append(element.detach())
-                else:
-                    x.append(element)
-            # Detach y in-place (inbetween computations can now be discarded)
-            outputs = ctx.fn(*x).detach_()
-
-        # clear memory from inputs
-        # only clear memory of node features
-        inputs[0].storage().resize_(0)
-
-        # store these tensor nodes for backward pass
-        ctx.inputs = [inputs]
-        ctx.outputs = [outputs]
-
-        return outputs
-
-    @staticmethod
-    def backward(ctx, *grad_outputs):  # pragma: no cover
-        if not torch.autograd._is_checkpoint_valid():
-            raise RuntimeError("InvertibleCheckpoint is not compatible with .grad(), please use .backward() if possible")
-        # retrieve input and output tensor nodes
-        if len(ctx.outputs) == 0:
-            raise RuntimeError("Trying to perform backward on the InvertibleCheckpoint for more than once.")
-        inputs = ctx.inputs.pop()
-        outputs = ctx.outputs.pop()
-
-        # recompute input
-        with torch.no_grad():
-            inputs_inverted = ctx.fn_inverse(*((outputs,)+inputs[1:]))
-            # clear memory from outputs
-            outputs.storage().resize_(0)
-
-            x = inputs[0]
-            x.storage().resize_(int(np.prod(x.size())))
-            x.set_(inputs_inverted)
-
-        # compute gradients
-        with torch.set_grad_enabled(True):
-            detached_inputs = []
-            for element in inputs:
-                if isinstance(element, torch.Tensor):
-                    detached_inputs.append(element.detach())
-                else:
-                    detached_inputs.append(element)
-            detached_inputs = tuple(detached_inputs)
-            for det_input, requires_grad in zip(detached_inputs, ctx.input_requires_grad):
-                det_input.requires_grad = requires_grad
-            temp_output = ctx.fn(*detached_inputs)
-
-        filtered_detached_inputs = tuple(filter(lambda x: x.requires_grad, detached_inputs))
-        gradients = torch.autograd.grad(outputs=(temp_output,),
-                                        inputs=filtered_detached_inputs + ctx.weights,
-                                        grad_outputs=grad_outputs)
-
-        input_gradients = []
-        i = 0
-        for rg in ctx.input_requires_grad:
-            if rg:
-                input_gradients.append(gradients[i])
-                i += 1
-            else:
-                input_gradients.append(None)
-
-        gradients = tuple(input_gradients) + gradients[-len(ctx.weights):]
-
-        return (None, None, None) + gradients
-
-
-class InvertibleModuleWrapper(nn.Module):
-    def __init__(self, fm, group=2):
-        """
-        The InvertibleModuleWrapper which enables memory savings during training by exploiting
-        the invertible properties of the wrapped module.
-        """
-        super(InvertibleModuleWrapper, self).__init__()
-        self.gnn_modules = nn.ModuleList()
-        for i in range(group):
-            if i == 0:
-                self.gnn_modules.append(fm)
-            else:
-                self.gnn_modules.append(deepcopy(fm))
-        self.group = group
-
-    def _forward(self, x, g, *args):
-        xs = torch.chunk(x, self.group, dim=-1)
-        chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=-1), args))
-        args_chunks = list(zip(*chunked_args))
-        y_in = sum(xs[1:])
-
-        ys = []
-        for i in range(self.group):
-            Fmd = self.gnn_modules[i](g, y_in, *args_chunks[i])
-            y = xs[i] + Fmd
-            y_in = y
-            ys.append(y)
-
-        out = torch.cat(ys, dim=-1)
-
-        return out
-
-    def _inverse(self, y, g, *args):
-        ys = torch.chunk(y, self.group, dim=-1)
-        chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=-1), args))
-        args_chunks = list(zip(*chunked_args))
-
-        xs = []
-        for i in range(self.group-1, -1, -1):
-            if i != 0:
-                y_in = ys[i-1]
-            else:
-                y_in = sum(xs)
-
-            Fmd = self.gnn_modules[i](g, y_in, *args_chunks[i])
-            x = ys[i] - Fmd
-            xs.append(x)
-
-        x = torch.cat(xs[::-1], dim=-1)
-
-        return x
-
-    def forward(self, g, x, *args):
-        """Forward operation :math:`R(x) = y`
-
-        Parameters
-        ----------
-            *xin : :obj:`torch.Tensor` tuple
-                Input torch tensor(s).
-
-        Returns
-        -------
-            :obj:`torch.Tensor` tuple
-                Output torch tensor(s) *y.
-
-        """
-        args = (x, g) + args
-        y = InvertibleCheckpoint.apply(
-            self._forward,
-            self._inverse,
-            len(args),
-            *(args + tuple([p for p in self.parameters() if p.requires_grad])))
-
-        return y
-
 class RevGAT(nn.Module):
     def __init__(
         self,
@@ -467,7 +308,7 @@ class RevGAT(nn.Module):
                     use_symmetric_norm=use_symmetric_norm,
                     residual=True,
                 )
-                conv = InvertibleModuleWrapper(fm, group=self.group)
+                conv = GroupRevRes(fm, group=self.group)
                 self.convs.append(conv)
 
         self.bias_last = ElementWiseLinear(n_classes, weight=False, bias=True, inplace=True)
