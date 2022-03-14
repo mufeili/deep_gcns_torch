@@ -299,7 +299,7 @@ class GroupAdditiveCoupling(torch.nn.Module):
 
         return x
 
-class InvertibleCheckpointFunction(torch.autograd.Function):
+class InvertibleCheckpoint(torch.autograd.Function):
     @staticmethod
     def forward(ctx, fn, fn_inverse, num_inputs, *inputs_and_weights):
         # store in context
@@ -340,10 +340,10 @@ class InvertibleCheckpointFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grad_outputs):  # pragma: no cover
         if not torch.autograd._is_checkpoint_valid():
-            raise RuntimeError("InvertibleCheckpointFunction is not compatible with .grad(), please use .backward() if possible")
+            raise RuntimeError("InvertibleCheckpoint is not compatible with .grad(), please use .backward() if possible")
         # retrieve input and output tensor nodes
         if len(ctx.outputs) == 0:
-            raise RuntimeError("Trying to perform backward on the InvertibleCheckpointFunction for more than once.")
+            raise RuntimeError("Trying to perform backward on the InvertibleCheckpoint for more than once.")
         inputs = ctx.inputs.pop()
         outputs = ctx.outputs.pop()
 
@@ -397,19 +397,56 @@ class InvertibleCheckpointFunction(torch.autograd.Function):
 
 
 class InvertibleModuleWrapper(nn.Module):
-    def __init__(self, fn):
+    def __init__(self, fm, group=2):
         """
         The InvertibleModuleWrapper which enables memory savings during training by exploiting
         the invertible properties of the wrapped module.
-
-        Parameters
-        ----------
-            fn : :obj:`torch.nn.Module`
-                A torch.nn.Module which has a forward and an inverse function implemented with
-                :math:`x == m.inverse(m.forward(x))`
         """
         super(InvertibleModuleWrapper, self).__init__()
-        self._fn = fn
+        self.Fms = nn.ModuleList()
+        for i in range(group):
+            if i == 0:
+                self.Fms.append(fm)
+            else:
+                self.Fms.append(deepcopy(fm))
+        self.group = group
+
+    def _forward(self, x, edge_index, *args):
+        xs = torch.chunk(x, self.group, dim=-1)
+        chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=-1), args))
+        args_chunks = list(zip(*chunked_args))
+        y_in = sum(xs[1:])
+
+        ys = []
+        for i in range(self.group):
+            Fmd = self.Fms[i](y_in, edge_index, *args_chunks[i])
+            y = xs[i] + Fmd
+            y_in = y
+            ys.append(y)
+
+        out = torch.cat(ys, dim=-1)
+
+        return out
+
+    def _inverse(self, y, edge_index, *args):
+        ys = torch.chunk(y, self.group, dim=-1)
+        chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=-1), args))
+        args_chunks = list(zip(*chunked_args))
+
+        xs = []
+        for i in range(self.group-1, -1, -1):
+            if i != 0:
+                y_in = ys[i-1]
+            else:
+                y_in = sum(xs)
+
+            Fmd = self.Fms[i](y_in, edge_index, *args_chunks[i])
+            x = ys[i] - Fmd
+            xs.append(x)
+
+        x = torch.cat(xs[::-1], dim=-1)
+
+        return x
 
     def forward(self, *xin):
         """Forward operation :math:`R(x) = y`
@@ -425,9 +462,9 @@ class InvertibleModuleWrapper(nn.Module):
                 Output torch tensor(s) *y.
 
         """
-        y = InvertibleCheckpointFunction.apply(
-            self._fn.forward,
-            self._fn.inverse,
+        y = InvertibleCheckpoint.apply(
+            self._forward,
+            self._inverse,
             len(xin),
             *(xin + tuple([p for p in self._fn.parameters() if p.requires_grad])))
 
@@ -468,7 +505,6 @@ class RevGAT(nn.Module):
             in_hidden = n_heads * n_hidden if i > 0 else in_feats
             out_hidden = n_hidden if i < n_layers - 1 else n_classes
             num_heads = n_heads if i < n_layers - 1 else 1
-            out_channels = n_heads
 
             if i == 0 or i == n_layers -1:
                 self.convs.append(
@@ -496,10 +532,10 @@ class RevGAT(nn.Module):
                     use_symmetric_norm=use_symmetric_norm,
                     residual=True,
                 )
-                invertible_module = GroupAdditiveCoupling(fm, group=self.group)
+                # invertible_module = GroupAdditiveCoupling(fm, group=self.group)
 
-                conv = InvertibleModuleWrapper(fn=invertible_module)
-
+                # conv = InvertibleModuleWrapper(fn=invertible_module)
+                conv = InvertibleModuleWrapper(fm, group=self.group)
                 self.convs.append(conv)
 
         self.bias_last = ElementWiseLinear(n_classes, weight=False, bias=True, inplace=True)
