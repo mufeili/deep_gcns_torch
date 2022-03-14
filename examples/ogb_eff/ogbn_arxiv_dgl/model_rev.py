@@ -271,11 +271,8 @@ class InvertibleCheckpoint(torch.autograd.Function):
                     x.append(element)
             outputs = ctx.fn(*x)
 
-        if not isinstance(outputs, tuple):
-            outputs = (outputs,)
-
-        # Detaches y in-place (inbetween computations can now be discarded)
-        detached_outputs = tuple([element.detach_() for element in outputs])
+        # Detach y in-place (inbetween computations can now be discarded)
+        detached_outputs = (outputs.detach_(),)
 
         # clear memory from inputs
         # only clear memory of node features
@@ -302,8 +299,7 @@ class InvertibleCheckpoint(torch.autograd.Function):
             # g and edge_emb
             inputs_inverted = ctx.fn_inverse(*(outputs+inputs[1:]))
             # clear memory from outputs
-            for element in outputs:
-                element.storage().resize_(0)
+            outputs[0].storage().resize_(0)
 
             x = inputs[0]
             x.storage().resize_(int(np.prod(x.size())))
@@ -324,8 +320,7 @@ class InvertibleCheckpoint(torch.autograd.Function):
         if not isinstance(temp_output, tuple):
             temp_output = (temp_output,)
 
-        filtered_detached_inputs = tuple(filter(lambda x: x.requires_grad,
-                                               detached_inputs))
+        filtered_detached_inputs = tuple(filter(lambda x: x.requires_grad, detached_inputs))
         gradients = torch.autograd.grad(outputs=temp_output,
                                         inputs=filtered_detached_inputs + ctx.weights,
                                         grad_outputs=grad_outputs)
