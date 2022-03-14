@@ -256,7 +256,6 @@ class InvertibleCheckpoint(torch.autograd.Function):
         ctx.fn = fn
         ctx.fn_inverse = fn_inverse
         ctx.weights = inputs_and_weights[num_inputs:]
-        ctx.num_inputs = num_inputs
         inputs = inputs_and_weights[:num_inputs]
 
         ctx.input_requires_grad = [element.requires_grad for element in inputs]
@@ -269,10 +268,8 @@ class InvertibleCheckpoint(torch.autograd.Function):
                     x.append(element.detach())
                 else:
                     x.append(element)
-            outputs = ctx.fn(*x)
-
-        # Detach y in-place (inbetween computations can now be discarded)
-        detached_outputs = (outputs.detach_(),)
+            # Detach y in-place (inbetween computations can now be discarded)
+            outputs = ctx.fn(*x).detach_()
 
         # clear memory from inputs
         # only clear memory of node features
@@ -280,9 +277,9 @@ class InvertibleCheckpoint(torch.autograd.Function):
 
         # store these tensor nodes for backward pass
         ctx.inputs = [inputs]
-        ctx.outputs = [detached_outputs]
+        ctx.outputs = [outputs]
 
-        return detached_outputs
+        return outputs
 
     @staticmethod
     def backward(ctx, *grad_outputs):  # pragma: no cover
@@ -296,9 +293,9 @@ class InvertibleCheckpoint(torch.autograd.Function):
 
         # recompute input
         with torch.no_grad():
-            inputs_inverted = ctx.fn_inverse(*(outputs+inputs[1:]))
+            inputs_inverted = ctx.fn_inverse(*((outputs,)+inputs[1:]))
             # clear memory from outputs
-            outputs[0].storage().resize_(0)
+            outputs.storage().resize_(0)
 
             x = inputs[0]
             x.storage().resize_(int(np.prod(x.size())))
@@ -343,12 +340,12 @@ class InvertibleModuleWrapper(nn.Module):
         the invertible properties of the wrapped module.
         """
         super(InvertibleModuleWrapper, self).__init__()
-        self.Fms = nn.ModuleList()
+        self.gnn_modules = nn.ModuleList()
         for i in range(group):
             if i == 0:
-                self.Fms.append(fm)
+                self.gnn_modules.append(fm)
             else:
-                self.Fms.append(deepcopy(fm))
+                self.gnn_modules.append(deepcopy(fm))
         self.group = group
 
     def _forward(self, x, g, *args):
@@ -359,7 +356,7 @@ class InvertibleModuleWrapper(nn.Module):
 
         ys = []
         for i in range(self.group):
-            Fmd = self.Fms[i](g, y_in, *args_chunks[i])
+            Fmd = self.gnn_modules[i](g, y_in, *args_chunks[i])
             y = xs[i] + Fmd
             y_in = y
             ys.append(y)
@@ -380,7 +377,7 @@ class InvertibleModuleWrapper(nn.Module):
             else:
                 y_in = sum(xs)
 
-            Fmd = self.Fms[i](g, y_in, *args_chunks[i])
+            Fmd = self.gnn_modules[i](g, y_in, *args_chunks[i])
             x = ys[i] - Fmd
             xs.append(x)
 
@@ -409,9 +406,6 @@ class InvertibleModuleWrapper(nn.Module):
             len(args),
             *(args + tuple([p for p in self.parameters() if p.requires_grad])))
 
-        # If the layer only has one input, we unpack the tuple again
-        if isinstance(y, tuple) and len(y) == 1:
-            return y[0]
         return y
 
 class RevGAT(nn.Module):
