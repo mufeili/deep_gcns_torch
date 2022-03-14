@@ -259,7 +259,7 @@ class GroupAdditiveCoupling(torch.nn.Module):
         super(GroupAdditiveCoupling, self).__init__()
 
         self.Fms = nn.ModuleList()
-        for i in range(self.group):
+        for i in range(group):
             if i == 0:
                 self.Fms.append(fm)
             else:
