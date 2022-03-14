@@ -229,7 +229,7 @@ class RevGATBlock(nn.Module):
         else:
             self.edge_encoder = None
 
-    def forward(self, x, graph, dropout_mask=None, perm=None, efeat=None):
+    def forward(self, graph, x, dropout_mask=None, perm=None, efeat=None):
         if perm is not None:
             perm = perm.squeeze()
         out = self.norm(x)
@@ -362,7 +362,7 @@ class InvertibleModuleWrapper(nn.Module):
 
         ys = []
         for i in range(self.group):
-            Fmd = self.Fms[i](y_in, g, *args_chunks[i])
+            Fmd = self.Fms[i](g, y_in, *args_chunks[i])
             y = xs[i] + Fmd
             y_in = y
             ys.append(y)
@@ -383,7 +383,7 @@ class InvertibleModuleWrapper(nn.Module):
             else:
                 y_in = sum(xs)
 
-            Fmd = self.Fms[i](y_in, g, *args_chunks[i])
+            Fmd = self.Fms[i](g, y_in, *args_chunks[i])
             x = ys[i] - Fmd
             xs.append(x)
 
