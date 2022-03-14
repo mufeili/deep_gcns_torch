@@ -466,7 +466,7 @@ class InvertibleModuleWrapper(nn.Module):
             self._forward,
             self._inverse,
             len(xin),
-            *(xin + tuple([p for p in self._fn.parameters() if p.requires_grad])))
+            *(xin + tuple([p for p in self.parameters() if p.requires_grad])))
 
         # If the layer only has one input, we unpack the tuple again
         if isinstance(y, tuple) and len(y) == 1:
