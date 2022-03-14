@@ -436,31 +436,6 @@ class InvertibleModuleWrapper(nn.Module):
             return y[0]
         return y
 
-    def inverse(self, *yin):
-        """Inverse operation :math:`R^{-1}(y) = x`
-
-        Parameters
-        ----------
-            *yin : :obj:`torch.Tensor` tuple
-                Input torch tensor(s).
-
-        Returns
-        -------
-            :obj:`torch.Tensor` tuple
-                Output torch tensor(s) *x.
-
-        """
-        x = InvertibleCheckpointFunction.apply(
-            self._fn.inverse,
-            self._fn.forward,
-            len(yin),
-            *(yin + tuple([p for p in self._fn.parameters() if p.requires_grad])))
-
-        # If the layer only has one input, we unpack the tuple again
-        if isinstance(x, tuple) and len(x) == 1:
-            return x[0]
-        return x
-
 class RevGAT(nn.Module):
     def __init__(
         self,
