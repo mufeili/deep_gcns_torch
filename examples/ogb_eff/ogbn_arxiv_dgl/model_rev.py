@@ -1,18 +1,13 @@
 import __init__
-import dgl.nn.pytorch as dglnn
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dgl import function as fn
-from dgl._ffi.base import DGLError
-from dgl.nn.pytorch.utils import Identity
 from dgl.ops import edge_softmax
 from dgl.utils import expand_as_pair
-import eff_gcn_modules.rev.memgcn as memgcn
 from eff_gcn_modules.rev.rev_layer import SharedDropout
-import copy
-
+from copy import deepcopy
 
 class ElementWiseLinear(nn.Module):
     def __init__(self, size, weight=True, bias=True, inplace=False):
@@ -263,7 +258,7 @@ class GroupAdditiveCoupling(torch.nn.Module):
             if i == 0:
                 self.Fms.append(fm)
             else:
-                self.Fms.append(copy.deepcopy(fm))
+                self.Fms.append(deepcopy(fm))
 
         self.group = group
 
@@ -275,7 +270,7 @@ class GroupAdditiveCoupling(torch.nn.Module):
 
         ys = []
         for i in range(self.group):
-            Fmd = self.Fms[i].forward(y_in, edge_index, *args_chunks[i])
+            Fmd = self.Fms[i](y_in, edge_index, *args_chunks[i])
             y = xs[i] + Fmd
             y_in = y
             ys.append(y)
@@ -296,7 +291,7 @@ class GroupAdditiveCoupling(torch.nn.Module):
             else:
                 y_in = sum(xs)
 
-            Fmd = self.Fms[i].forward(y_in, edge_index, *args_chunks[i])
+            Fmd = self.Fms[i](y_in, edge_index, *args_chunks[i])
             x = ys[i] - Fmd
             xs.append(x)
 
