@@ -14,26 +14,13 @@ except TypeError:
 
 class InvertibleCheckpointFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, fn, fn_inverse, num_bwd_passes, preserve_rng_state, num_inputs, *inputs_and_weights):
+    def forward(ctx, fn, fn_inverse, num_inputs, *inputs_and_weights):
         # store in context
         ctx.fn = fn
         ctx.fn_inverse = fn_inverse
         ctx.weights = inputs_and_weights[num_inputs:]
-        ctx.num_bwd_passes = num_bwd_passes
-        ctx.preserve_rng_state = preserve_rng_state
         ctx.num_inputs = num_inputs
         inputs = inputs_and_weights[:num_inputs]
-
-        if preserve_rng_state:
-            ctx.fwd_cpu_state = torch.get_rng_state()
-            # Don't eagerly initialize the cuda context by accident.
-            # (If the user intends that the context is initialized later, within their
-            # run_function, we SHOULD actually stash the cuda state here.  Unfortunately,
-            # we have no way to anticipate this will happen before we run the function.)
-            ctx.had_cuda_in_fwd = False
-            if torch.cuda._initialized:
-                ctx.had_cuda_in_fwd = True
-                ctx.fwd_gpu_devices, ctx.fwd_gpu_states = get_device_states(*inputs)
 
         ctx.input_requires_grad = [element.requires_grad for element in inputs]
 
@@ -58,8 +45,8 @@ class InvertibleCheckpointFunction(torch.autograd.Function):
         inputs[0].storage().resize_(0)
 
         # store these tensor nodes for backward pass
-        ctx.inputs = [inputs] * num_bwd_passes
-        ctx.outputs = [detached_outputs] * num_bwd_passes
+        ctx.inputs = [inputs]
+        ctx.outputs = [detached_outputs]
 
         return detached_outputs
 
@@ -69,8 +56,7 @@ class InvertibleCheckpointFunction(torch.autograd.Function):
             raise RuntimeError("InvertibleCheckpointFunction is not compatible with .grad(), please use .backward() if possible")
         # retrieve input and output tensor nodes
         if len(ctx.outputs) == 0:
-            raise RuntimeError("Trying to perform backward on the InvertibleCheckpointFunction for more than "
-                               "{} times! Try raising `num_bwd_passes` by one.".format(ctx.num_bwd_passes))
+            raise RuntimeError("Trying to perform backward on the InvertibleCheckpointFunction for more than once.")
         inputs = ctx.inputs.pop()
         outputs = ctx.outputs.pop()
 
@@ -79,13 +65,7 @@ class InvertibleCheckpointFunction(torch.autograd.Function):
         # present at this time during forward.  Restore the surrounding state
         # when we're done.
         rng_devices = []
-        if ctx.preserve_rng_state and ctx.had_cuda_in_fwd:
-            rng_devices = ctx.fwd_gpu_devices
-        with torch.random.fork_rng(devices=rng_devices, enabled=ctx.preserve_rng_state):
-            if ctx.preserve_rng_state:
-                torch.set_rng_state(ctx.fwd_cpu_state)
-                if ctx.had_cuda_in_fwd:
-                    set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
+        with torch.random.fork_rng(devices=rng_devices, enabled=False):
             # recompute input
             with torch.no_grad():
                 # edge_index and edge_emb
@@ -121,10 +101,6 @@ class InvertibleCheckpointFunction(torch.autograd.Function):
                                         inputs=filtered_detached_inputs + ctx.weights,
                                         grad_outputs=grad_outputs)
 
-        # Setting the gradients manually on the inputs and outputs (mimic backwards)
-        filtered_inputs = list(filter(lambda x: x.requires_grad,
-                                      inputs))
-
         input_gradients = []
         i = 0
         for rg in ctx.input_requires_grad:
@@ -136,12 +112,11 @@ class InvertibleCheckpointFunction(torch.autograd.Function):
 
         gradients = tuple(input_gradients) + gradients[-len(ctx.weights):]
 
-        return (None, None, None, None, None) + gradients
+        return (None, None, None) + gradients
 
 
 class InvertibleModuleWrapper(nn.Module):
-    def __init__(self, fn, num_bwd_passes=1,
-                 disable=False, preserve_rng_state=False):
+    def __init__(self, fn):
         """
         The InvertibleModuleWrapper which enables memory savings during training by exploiting
         the invertible properties of the wrapped module.
@@ -151,28 +126,8 @@ class InvertibleModuleWrapper(nn.Module):
             fn : :obj:`torch.nn.Module`
                 A torch.nn.Module which has a forward and an inverse function implemented with
                 :math:`x == m.inverse(m.forward(x))`
-
-            num_bwd_passes :obj:`int`, optional
-                Number of backward passes to retain a link with the output. After the last backward pass the output
-                is discarded and memory is freed.
-                Warning: if this value is raised higher than the number of required passes memory will not be freed
-                correctly anymore and the training process can quickly run out of memory.
-                Hence, The typical use case is to keep this at 1, until it raises an error for raising this value.
-
-            disable : :obj:`bool`, optional
-                This will disable using the InvertibleCheckpointFunction altogether.
-                Essentially this renders the function as `y = fn(x)` without any of the memory savings.
-
-            preserve_rng_state : :obj:`bool`, optional
-                Setting this will ensure that the same RNG state is used during reconstruction of the inputs.
-                By default
-                this is False since most invertible modules should have a valid inverse and hence are
-                deterministic.
         """
         super(InvertibleModuleWrapper, self).__init__()
-        self.disable = disable
-        self.num_bwd_passes = num_bwd_passes
-        self.preserve_rng_state = preserve_rng_state
         self._fn = fn
 
     def forward(self, *xin):
@@ -189,16 +144,11 @@ class InvertibleModuleWrapper(nn.Module):
                 Output torch tensor(s) *y.
 
         """
-        if not self.disable:
-            y = InvertibleCheckpointFunction.apply(
-                self._fn.forward,
-                self._fn.inverse,
-                self.num_bwd_passes,
-                self.preserve_rng_state,
-                len(xin),
-                *(xin + tuple([p for p in self._fn.parameters() if p.requires_grad])))
-        else:
-            y = self._fn(*xin)
+        y = InvertibleCheckpointFunction.apply(
+            self._fn.forward,
+            self._fn.inverse,
+            len(xin),
+            *(xin + tuple([p for p in self._fn.parameters() if p.requires_grad])))
 
         # If the layer only has one input, we unpack the tuple again
         if isinstance(y, tuple) and len(y) == 1:
@@ -219,16 +169,11 @@ class InvertibleModuleWrapper(nn.Module):
                 Output torch tensor(s) *x.
 
         """
-        if not self.disable:
-            x = InvertibleCheckpointFunction.apply(
-                self._fn.inverse,
-                self._fn.forward,
-                self.num_bwd_passes,
-                self.preserve_rng_state,
-                len(yin),
-                *(yin + tuple([p for p in self._fn.parameters() if p.requires_grad])))
-        else:
-            x = self._fn.inverse(*yin)
+        x = InvertibleCheckpointFunction.apply(
+            self._fn.inverse,
+            self._fn.forward,
+            len(yin),
+            *(yin + tuple([p for p in self._fn.parameters() if p.requires_grad])))
 
         # If the layer only has one input, we unpack the tuple again
         if isinstance(x, tuple) and len(x) == 1:

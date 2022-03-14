@@ -7,16 +7,15 @@ except:
     from gcn_revop import InvertibleModuleWrapper
 
 class GroupAdditiveCoupling(torch.nn.Module):
-    def __init__(self, Fms, split_dim=-1, group=2):
+    def __init__(self, Fms, group=2):
         super(GroupAdditiveCoupling, self).__init__()
 
         self.Fms = Fms
-        self.split_dim = split_dim
         self.group = group
 
     def forward(self, x, edge_index, *args):
-        xs = torch.chunk(x, self.group, dim=self.split_dim)
-        chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=self.split_dim), args))
+        xs = torch.chunk(x, self.group, dim=-1)
+        chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=-1), args))
         args_chunks = list(zip(*chunked_args))
         y_in = sum(xs[1:])
 
@@ -27,13 +26,13 @@ class GroupAdditiveCoupling(torch.nn.Module):
             y_in = y
             ys.append(y)
 
-        out = torch.cat(ys, dim=self.split_dim)
+        out = torch.cat(ys, dim=-1)
 
         return out
 
     def inverse(self, y, edge_index, *args):
-        ys = torch.chunk(y, self.group, dim=self.split_dim)
-        chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=self.split_dim), args))
+        ys = torch.chunk(y, self.group, dim=-1)
+        chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=-1), args))
         args_chunks = list(zip(*chunked_args))
 
         xs = []
@@ -47,6 +46,6 @@ class GroupAdditiveCoupling(torch.nn.Module):
             x = ys[i] - Fmd
             xs.append(x)
 
-        x = torch.cat(xs[::-1], dim=self.split_dim)
+        x = torch.cat(xs[::-1], dim=-1)
 
         return x
