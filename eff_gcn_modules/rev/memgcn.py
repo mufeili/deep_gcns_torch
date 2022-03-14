@@ -1,10 +1,5 @@
 import torch
 import torch.nn as nn
-import copy
-try:
-    from .gcn_revop import InvertibleModuleWrapper
-except:
-    from gcn_revop import InvertibleModuleWrapper
 
 class GroupAdditiveCoupling(torch.nn.Module):
     def __init__(self, Fms, group=2):

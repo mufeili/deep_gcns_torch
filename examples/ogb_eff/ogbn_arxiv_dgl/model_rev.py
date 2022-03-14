@@ -1,5 +1,6 @@
 import __init__
 import dgl.nn.pytorch as dglnn
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -253,6 +254,211 @@ class RevGATBlock(nn.Module):
         out = self.conv(graph, out, perm).flatten(1, -1)
         return out
 
+class GroupAdditiveCoupling(torch.nn.Module):
+    def __init__(self, Fms, group=2):
+        super(GroupAdditiveCoupling, self).__init__()
+
+        self.Fms = Fms
+        self.group = group
+
+    def forward(self, x, edge_index, *args):
+        xs = torch.chunk(x, self.group, dim=-1)
+        chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=-1), args))
+        args_chunks = list(zip(*chunked_args))
+        y_in = sum(xs[1:])
+
+        ys = []
+        for i in range(self.group):
+            Fmd = self.Fms[i].forward(y_in, edge_index, *args_chunks[i])
+            y = xs[i] + Fmd
+            y_in = y
+            ys.append(y)
+
+        out = torch.cat(ys, dim=-1)
+
+        return out
+
+    def inverse(self, y, edge_index, *args):
+        ys = torch.chunk(y, self.group, dim=-1)
+        chunked_args = list(map(lambda arg: torch.chunk(arg, self.group, dim=-1), args))
+        args_chunks = list(zip(*chunked_args))
+
+        xs = []
+        for i in range(self.group-1, -1, -1):
+            if i != 0:
+                y_in = ys[i-1]
+            else:
+                y_in = sum(xs)
+
+            Fmd = self.Fms[i].forward(y_in, edge_index, *args_chunks[i])
+            x = ys[i] - Fmd
+            xs.append(x)
+
+        x = torch.cat(xs[::-1], dim=-1)
+
+        return x
+
+class InvertibleCheckpointFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, fn, fn_inverse, num_inputs, *inputs_and_weights):
+        # store in context
+        ctx.fn = fn
+        ctx.fn_inverse = fn_inverse
+        ctx.weights = inputs_and_weights[num_inputs:]
+        ctx.num_inputs = num_inputs
+        inputs = inputs_and_weights[:num_inputs]
+
+        ctx.input_requires_grad = [element.requires_grad for element in inputs]
+
+        with torch.no_grad():
+            # Makes a detached copy which shares the storage
+            x = []
+            for element in inputs:
+                if isinstance(element, torch.Tensor):
+                    x.append(element.detach())
+                else:
+                    x.append(element)
+            outputs = ctx.fn(*x)
+
+        if not isinstance(outputs, tuple):
+            outputs = (outputs,)
+
+        # Detaches y in-place (inbetween computations can now be discarded)
+        detached_outputs = tuple([element.detach_() for element in outputs])
+
+        # clear memory from inputs
+        # only clear memory of node features
+        inputs[0].storage().resize_(0)
+
+        # store these tensor nodes for backward pass
+        ctx.inputs = [inputs]
+        ctx.outputs = [detached_outputs]
+
+        return detached_outputs
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):  # pragma: no cover
+        if not torch.autograd._is_checkpoint_valid():
+            raise RuntimeError("InvertibleCheckpointFunction is not compatible with .grad(), please use .backward() if possible")
+        # retrieve input and output tensor nodes
+        if len(ctx.outputs) == 0:
+            raise RuntimeError("Trying to perform backward on the InvertibleCheckpointFunction for more than once.")
+        inputs = ctx.inputs.pop()
+        outputs = ctx.outputs.pop()
+
+        # recompute input
+        with torch.no_grad():
+            # edge_index and edge_emb
+            inputs_inverted = ctx.fn_inverse(*(outputs+inputs[1:]))
+            # clear memory from outputs
+            for element in outputs:
+                element.storage().resize_(0)
+
+            if not isinstance(inputs_inverted, tuple):
+                inputs_inverted = (inputs_inverted,)
+            for element_original, element_inverted in zip(inputs, inputs_inverted):
+                element_original.storage().resize_(int(np.prod(element_original.size())))
+                element_original.set_(element_inverted)
+
+        # compute gradients
+        with torch.set_grad_enabled(True):
+            detached_inputs = []
+            for element in inputs:
+                if isinstance(element, torch.Tensor):
+                    detached_inputs.append(element.detach())
+                else:
+                    detached_inputs.append(element)
+            detached_inputs = tuple(detached_inputs)
+            for det_input, requires_grad in zip(detached_inputs, ctx.input_requires_grad):
+                det_input.requires_grad = requires_grad
+            temp_output = ctx.fn(*detached_inputs)
+        if not isinstance(temp_output, tuple):
+            temp_output = (temp_output,)
+
+        filtered_detached_inputs = tuple(filter(lambda x: x.requires_grad,
+                                               detached_inputs))
+        gradients = torch.autograd.grad(outputs=temp_output,
+                                        inputs=filtered_detached_inputs + ctx.weights,
+                                        grad_outputs=grad_outputs)
+
+        input_gradients = []
+        i = 0
+        for rg in ctx.input_requires_grad:
+            if rg:
+                input_gradients.append(gradients[i])
+                i += 1
+            else:
+                input_gradients.append(None)
+
+        gradients = tuple(input_gradients) + gradients[-len(ctx.weights):]
+
+        return (None, None, None) + gradients
+
+
+class InvertibleModuleWrapper(nn.Module):
+    def __init__(self, fn):
+        """
+        The InvertibleModuleWrapper which enables memory savings during training by exploiting
+        the invertible properties of the wrapped module.
+
+        Parameters
+        ----------
+            fn : :obj:`torch.nn.Module`
+                A torch.nn.Module which has a forward and an inverse function implemented with
+                :math:`x == m.inverse(m.forward(x))`
+        """
+        super(InvertibleModuleWrapper, self).__init__()
+        self._fn = fn
+
+    def forward(self, *xin):
+        """Forward operation :math:`R(x) = y`
+
+        Parameters
+        ----------
+            *xin : :obj:`torch.Tensor` tuple
+                Input torch tensor(s).
+
+        Returns
+        -------
+            :obj:`torch.Tensor` tuple
+                Output torch tensor(s) *y.
+
+        """
+        y = InvertibleCheckpointFunction.apply(
+            self._fn.forward,
+            self._fn.inverse,
+            len(xin),
+            *(xin + tuple([p for p in self._fn.parameters() if p.requires_grad])))
+
+        # If the layer only has one input, we unpack the tuple again
+        if isinstance(y, tuple) and len(y) == 1:
+            return y[0]
+        return y
+
+    def inverse(self, *yin):
+        """Inverse operation :math:`R^{-1}(y) = x`
+
+        Parameters
+        ----------
+            *yin : :obj:`torch.Tensor` tuple
+                Input torch tensor(s).
+
+        Returns
+        -------
+            :obj:`torch.Tensor` tuple
+                Output torch tensor(s) *x.
+
+        """
+        x = InvertibleCheckpointFunction.apply(
+            self._fn.inverse,
+            self._fn.forward,
+            len(yin),
+            *(yin + tuple([p for p in self._fn.parameters() if p.requires_grad])))
+
+        # If the layer only has one input, we unpack the tuple again
+        if isinstance(x, tuple) and len(x) == 1:
+            return x[0]
+        return x
 
 class RevGAT(nn.Module):
     def __init__(
@@ -321,10 +527,9 @@ class RevGAT(nn.Module):
                     else:
                         Fms.append(copy.deepcopy(fm))
 
-                invertible_module = memgcn.GroupAdditiveCoupling(Fms,
-                                                                 group=self.group)
+                invertible_module = GroupAdditiveCoupling(Fms, group=self.group)
 
-                conv = memgcn.InvertibleModuleWrapper(fn=invertible_module)
+                conv = InvertibleModuleWrapper(fn=invertible_module)
 
                 self.convs.append(conv)
 

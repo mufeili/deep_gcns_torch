@@ -1,17 +1,3 @@
-"""This module is implemented by Guohao Li based on MemCNN @ Copyright (c) 2018 Sil C. van de Leemput under MIT license."""
-
-import numpy as np
-import torch
-import torch.nn as nn
-
-use_context_mans = True
-
-try:
-    pytorch_version_one_and_above = int(torch.__version__[0]) > 0
-except TypeError:
-    pytorch_version_one_and_above = True
-
-
 class InvertibleCheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, fn, fn_inverse, num_inputs, *inputs_and_weights):
@@ -60,25 +46,19 @@ class InvertibleCheckpointFunction(torch.autograd.Function):
         inputs = ctx.inputs.pop()
         outputs = ctx.outputs.pop()
 
-        # recompute input if necessary
-        # Stash the surrounding rng state, and mimic the state that was
-        # present at this time during forward.  Restore the surrounding state
-        # when we're done.
-        rng_devices = []
-        with torch.random.fork_rng(devices=rng_devices, enabled=False):
-            # recompute input
-            with torch.no_grad():
-                # edge_index and edge_emb
-                inputs_inverted = ctx.fn_inverse(*(outputs+inputs[1:]))
-                # clear memory from outputs
-                for element in outputs:
-                    element.storage().resize_(0)
+        # recompute input
+        with torch.no_grad():
+            # edge_index and edge_emb
+            inputs_inverted = ctx.fn_inverse(*(outputs+inputs[1:]))
+            # clear memory from outputs
+            for element in outputs:
+                element.storage().resize_(0)
 
-                if not isinstance(inputs_inverted, tuple):
-                    inputs_inverted = (inputs_inverted,)
-                for element_original, element_inverted in zip(inputs, inputs_inverted):
-                    element_original.storage().resize_(int(np.prod(element_original.size())))
-                    element_original.set_(element_inverted)
+            if not isinstance(inputs_inverted, tuple):
+                inputs_inverted = (inputs_inverted,)
+            for element_original, element_inverted in zip(inputs, inputs_inverted):
+                element_original.storage().resize_(int(np.prod(element_original.size())))
+                element_original.set_(element_inverted)
 
         # compute gradients
         with torch.set_grad_enabled(True):
@@ -179,29 +159,3 @@ class InvertibleModuleWrapper(nn.Module):
         if isinstance(x, tuple) and len(x) == 1:
             return x[0]
         return x
-
-# To consider:  maybe get_device_states and set_device_states should reside in
-# torch/random.py?
-#
-# get_device_states and set_device_states cannot be imported from
-# torch.utils.checkpoint, since it was not
-# present in older versions, so we include a copy here.
-def get_device_states(*args):
-      # This will not error out if "arg" is a CPU tensor or a non-tensor type
-      # because
-      # the conditionals short-circuit.
-      fwd_gpu_devices = list(set(arg.get_device() for arg in args
-                            if isinstance(arg, torch.Tensor) and arg.is_cuda))
-
-      fwd_gpu_states = []
-      for device in fwd_gpu_devices:
-          with torch.cuda.device(device):
-              fwd_gpu_states.append(torch.cuda.get_rng_state())
-
-      return fwd_gpu_devices, fwd_gpu_states
-
-
-def set_device_states(devices, states):
-      for device, state in zip(devices, states):
-          with torch.cuda.device(device):
-              torch.cuda.set_rng_state(state)
